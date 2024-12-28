@@ -51,6 +51,7 @@ def smooth_ln_fcs_llama_like(ln, fcs, act_scales, alpha=0.5):
         fcs = [fcs]
     assert isinstance(ln, (LlamaRMSNorm, MistralRMSNorm, MixtralRMSNorm))
     for fc in fcs:
+        print(f"Module: {fc}, Type: {type(fc)}")
         assert isinstance(fc, nn.Linear)
         assert ln.weight.numel() == fc.in_features == act_scales.numel()
     device, dtype = fcs[0].weight.device, fcs[0].weight.dtype
@@ -158,3 +159,113 @@ def smooth_lm(model, scales, alpha=0.5):
             fcs_input_scales = scales[name + ".block_sparse_moe.gate"]
 
             smooth_ln_fcs_llama_like(ffn_ln, fcs, fcs_input_scales, alpha)
+            
+
+@torch.no_grad()
+def smooth_lm_attention_only(model, scales, alpha=0.5):
+    for name, module in model.named_modules():
+        if isinstance(module, OPTDecoderLayer):
+            # 處理 Attention 層
+            attn_ln = module.self_attn_layer_norm
+            qkv = [
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj,
+            ]
+            qkv_input_scales = scales[name + ".self_attn.q_proj"]
+            smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
+
+        elif isinstance(module, BloomBlock):
+            # 處理 Attention 層
+            attn_ln = module.input_layernorm
+            qkv = module.self_attention.query_key_value
+            qkv_input_scales = scales[name + ".self_attention.query_key_value"]
+            smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
+
+        elif isinstance(module, FalconDecoderLayer):
+            # 處理 Attention 層
+            qkv = module.self_attention.query_key_value
+            qkv_input_scales = scales[name + ".self_attention.query_key_value"]
+
+            if (
+                not module.config.new_decoder_architecture
+                and module.config.parallel_attn
+            ):
+                attn_ln = module.input_layernorm
+                smooth_ln_fcs(attn_ln, [qkv], qkv_input_scales, alpha)
+            else:
+                attn_ln = (
+                    module.ln_attn
+                    if module.config.new_decoder_architecture
+                    else module.input_layernorm
+                )
+                smooth_ln_fcs(attn_ln, qkv, qkv_input_scales, alpha)
+
+        elif isinstance(module, (LlamaDecoderLayer, MistralDecoderLayer)):
+            # 處理 Attention 層
+            attn_ln = module.input_layernorm  # attention forward norm
+            qkv = [
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj,
+            ]
+            qkv_input_scales = scales[name + ".self_attn.q_proj"]
+            smooth_ln_fcs_llama_like(attn_ln, qkv, qkv_input_scales, alpha)
+
+        elif isinstance(module, MixtralDecoderLayer):
+            # 處理 Attention 層
+            attn_ln = module.input_layernorm  # attention forward norm
+            qkv = [
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj,
+            ]
+            qkv_input_scales = scales[name + ".self_attn.q_proj"]
+            smooth_ln_fcs_llama_like(attn_ln, qkv, qkv_input_scales, alpha)
+
+
+@torch.no_grad()
+def smooth_lm_layer(model, scales, alpha=0.5, quant_layers=range(4)):
+    """
+    Applies smooth quantization to the specified layers of the model.
+
+    Args:
+        model: The model to be quantized.
+        scales: Activation scales dictionary.
+        alpha: Balancing factor for weight and activation scaling.
+        quant_layers: Range of layer indices to apply quantization.
+    """
+    for name, module in model.named_modules():
+        # 獲取層索引
+        if not name.startswith("model.layers."):
+            continue
+        try:
+            layer_idx = int(name.split(".")[2])
+        except ValueError:
+            continue
+
+        # 只對量化層（0-3層）進行處理
+        if layer_idx not in quant_layers:
+            print(f"Skipping layer {layer_idx}")
+            continue
+
+        print(f"Processing layer {layer_idx}")
+
+        # 適配 Llama 層的處理邏輯
+        if isinstance(module, (LlamaDecoderLayer, MistralDecoderLayer)):
+            attn_ln = module.input_layernorm  # attention forward norm
+            qkv = [
+                module.self_attn.q_proj,
+                module.self_attn.k_proj,
+                module.self_attn.v_proj,
+            ]
+
+            qkv_input_scales = scales[name + ".self_attn.q_proj"]
+            smooth_ln_fcs_llama_like(attn_ln, qkv, qkv_input_scales, alpha)
+
+            ffn_ln = module.post_attention_layernorm  # feed forward norm
+            fcs = [module.mlp.gate_proj, module.mlp.up_proj]
+            fcs_input_scales = scales[name + ".mlp.gate_proj"]
+
+            smooth_ln_fcs_llama_like(ffn_ln, fcs, fcs_input_scales, alpha)
+
